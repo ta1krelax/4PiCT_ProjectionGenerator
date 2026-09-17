@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# generated projection datasets (large binary output, not source)
+*.npy
+projections.npy
+astra_vectors.npy
+metadata.json
+
+# scratch/test artifacts
+*.stl
+!sample_data/*.stl
+out_*/

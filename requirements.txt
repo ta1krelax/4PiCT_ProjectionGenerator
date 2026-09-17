@@ -1,0 +1,6 @@
+numpy
+scipy
+trimesh
+warp-lang
+PySide6
+matplotlib
