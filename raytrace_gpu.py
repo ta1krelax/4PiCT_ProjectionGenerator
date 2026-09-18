@@ -73,6 +73,17 @@ def _trace_batch_kernel(
     out[tid] = path_length
 
 
+@wp.kernel
+def _occupancy_kernel(
+    mesh_id: wp.uint64,
+    points: wp.array(dtype=wp.vec3),
+    out: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    count = wp.mesh_query_ray_count_intersections(mesh_id, points[tid], wp.vec3(1.0, 0.0, 0.0))
+    out[tid] = float(count % 2)
+
+
 class GpuProjector:
     def __init__(self, vertices: np.ndarray, faces: np.ndarray, device: str):
         self.device = device
@@ -115,6 +126,23 @@ class GpuProjector:
         )
         wp.synchronize_device(self.device)
         return out.numpy().reshape(n_views, rows, cols)
+
+    def occupancy(self, points: np.ndarray) -> np.ndarray:
+        """GPU inside/outside test for arbitrary points (e.g. a reconstruction voxel
+        grid), via ray-parity counting. Requires a watertight mesh. Returns a bool
+        array, shape (len(points),).
+        """
+        pts_wp = wp.array(np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=self.device)
+        out = wp.zeros(len(points), dtype=wp.float32, device=self.device)
+        wp.launch(
+            _occupancy_kernel,
+            dim=len(points),
+            inputs=[self.mesh.id, pts_wp],
+            outputs=[out],
+            device=self.device,
+        )
+        wp.synchronize_device(self.device)
+        return out.numpy().astype(bool)
 
 
 def generate_sinogram(

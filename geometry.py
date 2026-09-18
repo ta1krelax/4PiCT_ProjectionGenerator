@@ -113,6 +113,21 @@ def build_all_views(directions: np.ndarray, rotation_center: np.ndarray, sod: fl
     return [build_view_geometry(d, rotation_center, sod, sdd) for d in directions]
 
 
+def auto_fit_pixel_pitch(radius: float, sod: float, sdd: float, rows: int, cols: int, margin: float = 1.1) -> float:
+    """Pixel pitch that exactly fits a bounding sphere of `radius` (about the rotation
+    center) onto the detector, with `margin` headroom, for the given SOD/SDD/resolution.
+
+    Uses the exact point-source tangent-cone geometry (not an approximation): the
+    sphere's silhouette on the detector has radius sdd * tan(arcsin(radius / sod)).
+    Raises ValueError if `radius >= sod` (source would sit inside/behind the object).
+    """
+    if radius >= sod:
+        raise ValueError(f"radius ({radius:.3f}) >= SOD ({sod:.3f}): source would be inside/behind the object")
+    half_angle = np.arcsin(radius / sod)
+    required_half_extent = sdd * np.tan(half_angle) * margin
+    return 2.0 * required_half_extent / min(rows, cols)
+
+
 def to_astra_cone_vec(views, rotation_center: np.ndarray, pixel_pitch: float) -> np.ndarray:
     """Convert world-space views to ASTRA 'cone_vec' geometry rows, centered on rotation_center.
 

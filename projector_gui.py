@@ -6,6 +6,7 @@ resolution), then batch-generate a projection dataset ready for ASTRA reconstruc
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -19,7 +20,9 @@ from PySide6 import QtCore, QtWidgets
 
 import geometry as geom
 import io_utils
+import n_search
 import raytrace_gpu as rt
+import reconstruction as recon
 import shape_metrics
 from mesh_viewer import MeshViewer3D
 from preview_gallery import PreviewGallery
@@ -28,7 +31,9 @@ from theme import FLAT_QSS
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Microsoft JhengHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-RIBBON_SECTIONS = ["输入 / 输出", "旋转中心", "锥束几何", "材料", "采样与设备", "样品评估", "序列生成"]
+RIBBON_SECTIONS = [
+    "输入 / 输出", "旋转中心", "锥束几何", "材料", "采样与设备", "样品评估", "序列生成", "批量实验(N搜索)",
+]
 
 # preview_direction_combo index -> world-space direction (rotation_center -> source), unit vector.
 # index 0 ("采样方案第1个视角") is handled separately by pulling from the sampling scheme.
@@ -253,6 +258,159 @@ class ShapeMetricsThread(QtCore.QThread):
             self.failed.emit(traceback.format_exc())
 
 
+class BatchExperimentThread(QtCore.QThread):
+    """For each STL sample: auto-fit geometry, adaptively search N until the
+    reconstruction's SSIM against the sample's own ground-truth voxelization lands
+    near a target value, then save the converged dataset + reconstruction + shape
+    metrics. One failing sample is recorded and skipped, not fatal to the batch.
+    """
+
+    sample_progress = QtCore.Signal(int, int, str)  # index, total, sample_name
+    search_eval = QtCore.Signal(str, int, float, int)  # sample_name, N, ssim, eval_index
+    sample_done = QtCore.Signal(str, dict)
+    sample_failed = QtCore.Signal(str, str)
+    all_done = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, stl_paths: list[str], common: dict, search_cfg: dict, shape_ranks: set, out_dir: str):
+        super().__init__()
+        self.stl_paths = stl_paths
+        self.common = common
+        self.search_cfg = search_cfg
+        self.shape_ranks = shape_ranks
+        self.out_dir = out_dir
+        self._cancel = False
+
+    def request_cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            os.makedirs(self.out_dir, exist_ok=True)
+            overall = []
+            total = len(self.stl_paths)
+
+            for i, stl_path in enumerate(self.stl_paths):
+                if self._cancel:
+                    break
+                name = os.path.splitext(os.path.basename(stl_path))[0]
+                self.sample_progress.emit(i, total, name)
+                sample_out = os.path.join(self.out_dir, name)
+                try:
+                    result = self._run_one_sample(stl_path, name, sample_out)
+                    self.sample_done.emit(name, result)
+                    overall.append(result)
+                except Exception:
+                    err = traceback.format_exc()
+                    self.sample_failed.emit(name, err)
+                    overall.append({"sample": name, "status": "failed", "error": err})
+
+            summary_path = os.path.join(self.out_dir, "batch_summary.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "target_ssim": self.search_cfg["target_ssim"],
+                        "samples": overall,
+                    },
+                    f, indent=2, ensure_ascii=False, default=str,
+                )
+            self.all_done.emit(summary_path)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+    def _run_one_sample(self, stl_path: str, name: str, sample_out: str) -> dict:
+        c = self.common
+        s = self.search_cfg
+        mesh = trimesh.load(stl_path, force="mesh")
+        rotation_center = mesh.centroid.copy()
+        sod, sdd = c["sod"], c["sdd"]
+        rows, cols = c["rows"], c["cols"]
+        mu, device, scheme_name = c["mu"], c["device"], c["scheme_name"]
+
+        radius = float(np.max(np.linalg.norm(mesh.vertices - rotation_center, axis=1)))
+        pixel_pitch = (
+            geom.auto_fit_pixel_pitch(radius, sod, sdd, rows, cols)
+            if c["auto_fit_fov"] else c["pixel_pitch"]
+        )
+        vol_half = recon.default_vol_half(radius, margin=c["vol_margin"])
+        n_voxels = c["n_voxels"]
+
+        ground_truth = recon.voxelize_ground_truth(mesh.vertices, mesh.faces, vol_half, n_voxels, rotation_center, device)
+
+        last = {}
+
+        def evaluate(n: int) -> float:
+            directions = geom.SAMPLING_SCHEMES[scheme_name](n)
+            views = geom.build_all_views(directions, rotation_center, sod, sdd)
+            sino = rt.generate_sinogram(
+                mesh.vertices, mesh.faces, views, rows, cols, pixel_pitch, mu, device,
+                chunk_size=max(1, min(25, len(views))),
+            )
+            astra_vectors = geom.to_astra_cone_vec(views, rotation_center, pixel_pitch)
+            rec = recon.reconstruct(
+                sino, astra_vectors, rows, cols, vol_half, n_voxels,
+                algorithm=c["algorithm"], iterations=c["iterations"],
+            )
+            score = recon.compute_ssim(ground_truth, rec, mu)
+            last.update(sino=sino, astra_vectors=astra_vectors, rec=rec, n=n)
+            return score
+
+        eval_count = {"n": 0}
+
+        def on_eval(n, score):
+            eval_count["n"] += 1
+            self.search_eval.emit(name, n, score, eval_count["n"])
+
+        search_result = n_search.search_n_for_target_ssim(
+            evaluate, n_init=s["n_init"], target_ssim=s["target_ssim"],
+            n_min=s["n_min"], n_max=s["n_max"], ssim_tol=s["ssim_tol"], n_tol=s["n_tol"],
+            max_evals=s["max_evals"], should_stop=lambda: self._cancel, on_eval=on_eval,
+        )
+
+        best_n = search_result["best_n"]
+        if last.get("n") != best_n:
+            best_ssim = evaluate(best_n)
+        else:
+            best_ssim = search_result["best_ssim"]
+
+        os.makedirs(sample_out, exist_ok=True)
+        meta = {
+            "stl_path": stl_path,
+            "units": "same as STL file (assumed mm)",
+            "sampling_scheme": scheme_name,
+            "n_views": best_n,
+            "sod_mm": sod, "sdd_mm": sdd, "magnification": sdd / sod,
+            "pixel_pitch_mm": pixel_pitch, "detector_rows": rows, "detector_cols": cols,
+            "mu_per_mm": mu, "rotation_center_mm": rotation_center.tolist(), "device_used": device,
+        }
+        io_utils.save_dataset(sample_out, last["sino"], last["astra_vectors"], meta)
+        np.save(os.path.join(sample_out, "reconstruction.npy"), last["rec"].astype(np.float32))
+        np.save(os.path.join(sample_out, "ground_truth.npy"), ground_truth.astype(np.uint8))
+
+        shape_results = {}
+        if self.shape_ranks:
+            shape_results = shape_metrics.compute_shape_metrics(
+                mesh, self.shape_ranks, n_views=best_n, voxel_target=64, percentile=5.0,
+            )
+
+        result = {
+            "sample": name, "status": "ok",
+            "best_n": best_n, "best_ssim": best_ssim,
+            "target_ssim": s["target_ssim"],
+            "target_reached": abs(best_ssim - s["target_ssim"]) <= s["ssim_tol"],
+            "radius_mm": radius, "pixel_pitch_mm": pixel_pitch,
+            "algorithm": c["algorithm"], "iterations": c["iterations"], "n_voxels": n_voxels,
+            "search_history": search_result["history"],
+            "stopped_early": search_result["stopped_early"],
+            "shape_metrics": shape_results,
+            "folder": sample_out,
+        }
+        with open(os.path.join(sample_out, "experiment_result.json"), "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+        return result
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -263,6 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stl_path: str | None = None
         self.scan_thread: ScanThread | None = None
         self.seq_thread: SequenceThread | None = None
+        self.batch_thread: "BatchExperimentThread | None" = None
         self._last_directions = None
 
         self._build_ui()
@@ -331,6 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("采样与设备", self._build_sampling_device_panel),
             ("样品评估", self._build_shape_eval_panel),
             ("序列生成", self._build_sequence_panel),
+            ("批量实验(N搜索)", self._build_batch_experiment_panel),
         ]
         self.section_dialogs: list[SectionDialog] = []
         for i, (title, builder) in enumerate(sections):
@@ -649,6 +809,142 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("请至少填一段 (起始N, 结束N, 步长)")
         return geom.parse_n_sequence(segments)
 
+    def _build_batch_experiment_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        hint = QtWidgets.QLabel(
+            "对一批不同的STL样品自动跑\"生成投影 -> ASTRA重建 -> 算SSIM -> 调整N\"的闭环,\n"
+            "直到SSIM落在目标值附近(或搜索次数/N区间用完, 会如实报告\"未达标\"而不是硬凑)。\n"
+            "SOD/放大倍率/mu/采样方式/设备复用其它面板里当前的设置; 旋转中心对每个样品都\n"
+            "自动用它自己的质心, 不用手动一个个改。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #5b6472; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self.batch_sample_list = QtWidgets.QListWidget()
+        self.batch_sample_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.batch_sample_list.setMaximumHeight(110)
+        layout.addWidget(self.batch_sample_list)
+
+        file_btns = QtWidgets.QHBoxLayout()
+        add_files_btn = QtWidgets.QPushButton("+ 添加STL文件...")
+        add_files_btn.clicked.connect(self.on_add_batch_files)
+        add_folder_btn = QtWidgets.QPushButton("+ 添加文件夹内所有STL")
+        add_folder_btn.clicked.connect(self.on_add_batch_folder)
+        remove_btn = QtWidgets.QPushButton("- 删除选中")
+        remove_btn.clicked.connect(self.on_remove_batch_samples)
+        file_btns.addWidget(add_files_btn)
+        file_btns.addWidget(add_folder_btn)
+        file_btns.addWidget(remove_btn)
+        layout.addLayout(file_btns)
+
+        form = QtWidgets.QFormLayout()
+
+        self.target_ssim_spin = self._make_spinbox(0.0, 1.0, 0.85)
+        self.target_ssim_spin.setDecimals(3)
+        form.addRow("目标 SSIM:", self.target_ssim_spin)
+
+        self.n_init_spin = QtWidgets.QSpinBox()
+        self.n_init_spin.setRange(1, 200000)
+        self.n_init_spin.setValue(1000)
+        form.addRow("起始 N:", self.n_init_spin)
+
+        self.n_min_spin = QtWidgets.QSpinBox()
+        self.n_min_spin.setRange(1, 200000)
+        self.n_min_spin.setValue(20)
+        form.addRow("N 下限:", self.n_min_spin)
+
+        self.n_max_spin = QtWidgets.QSpinBox()
+        self.n_max_spin.setRange(1, 200000)
+        self.n_max_spin.setValue(5000)
+        form.addRow("N 上限:", self.n_max_spin)
+
+        self.ssim_tol_spin = self._make_spinbox(0.0001, 0.5, 0.01)
+        self.ssim_tol_spin.setDecimals(4)
+        form.addRow("SSIM 容差:", self.ssim_tol_spin)
+
+        self.n_tol_spin = QtWidgets.QSpinBox()
+        self.n_tol_spin.setRange(1, 1000)
+        self.n_tol_spin.setValue(10)
+        form.addRow("N 收敛容差:", self.n_tol_spin)
+
+        self.max_evals_spin = QtWidgets.QSpinBox()
+        self.max_evals_spin.setRange(1, 100)
+        self.max_evals_spin.setValue(12)
+        form.addRow("单样品最大搜索次数:", self.max_evals_spin)
+
+        self.recon_algo_combo = QtWidgets.QComboBox()
+        self.recon_algo_combo.addItems(list(recon.ALGORITHMS.keys()))
+        form.addRow("重建算法:", self.recon_algo_combo)
+
+        self.recon_iters_spin = QtWidgets.QSpinBox()
+        self.recon_iters_spin.setRange(1, 10000)
+        self.recon_iters_spin.setValue(100)
+        form.addRow("迭代次数 (仅迭代算法):", self.recon_iters_spin)
+
+        self.vol_voxels_spin = QtWidgets.QSpinBox()
+        self.vol_voxels_spin.setRange(16, 512)
+        self.vol_voxels_spin.setValue(96)
+        form.addRow("重建体素分辨率 (每边体素数):", self.vol_voxels_spin)
+
+        self.vol_margin_spin = self._make_spinbox(1.0, 3.0, 1.3)
+        form.addRow("重建体积边界余量 (相对样品半径):", self.vol_margin_spin)
+
+        layout.addLayout(form)
+
+        self.batch_auto_fit_cb = QtWidgets.QCheckBox("每个样品自动匹配像素尺寸 (避免裁切, 忽略当前手动设的像素尺寸)")
+        self.batch_auto_fit_cb.setChecked(True)
+        layout.addWidget(self.batch_auto_fit_cb)
+
+        self.batch_shape_metrics_cb = QtWidgets.QCheckBox("同时计算样品形态参数 (复用\"样品评估\"面板里当前勾选的参数)")
+        self.batch_shape_metrics_cb.setChecked(True)
+        layout.addWidget(self.batch_shape_metrics_cb)
+
+        run_row = QtWidgets.QHBoxLayout()
+        self.batch_run_btn = QtWidgets.QPushButton("开始批量实验")
+        self.batch_run_btn.setObjectName("primaryAction")
+        self.batch_run_btn.clicked.connect(self.on_run_batch_experiment)
+        self.batch_stop_btn = QtWidgets.QPushButton("停止")
+        self.batch_stop_btn.setEnabled(False)
+        self.batch_stop_btn.clicked.connect(self.on_stop_batch_experiment)
+        run_row.addWidget(self.batch_run_btn)
+        run_row.addWidget(self.batch_stop_btn)
+        layout.addLayout(run_row)
+
+        prog_form = QtWidgets.QFormLayout()
+        self.batch_sample_progress = QtWidgets.QProgressBar()
+        prog_form.addRow("样品进度:", self.batch_sample_progress)
+        self.batch_search_progress = QtWidgets.QProgressBar()
+        prog_form.addRow("当前样品搜索进度:", self.batch_search_progress)
+        layout.addLayout(prog_form)
+
+        self.batch_result_table = QtWidgets.QTableWidget(0, 5)
+        self.batch_result_table.setHorizontalHeaderLabels(["样品", "收敛 N", "最终 SSIM", "达标", "文件夹"])
+        self.batch_result_table.horizontalHeader().setStretchLastSection(True)
+        self.batch_result_table.setMinimumHeight(160)
+        layout.addWidget(self.batch_result_table)
+
+        return panel
+
+    def on_add_batch_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "选择 STL 文件 (可多选)", "", "STL Files (*.stl)")
+        for p in paths:
+            self.batch_sample_list.addItem(p)
+
+    def on_add_batch_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "选择包含STL的文件夹")
+        if not folder:
+            return
+        found = sorted(glob.glob(os.path.join(folder, "*.stl"))) + sorted(glob.glob(os.path.join(folder, "*.STL")))
+        for p in found:
+            self.batch_sample_list.addItem(p)
+
+    def on_remove_batch_samples(self):
+        for item in self.batch_sample_list.selectedItems():
+            self.batch_sample_list.takeItem(self.batch_sample_list.row(item))
+
     @staticmethod
     def _wrap(inner_layout: QtWidgets.QLayout) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -693,9 +989,12 @@ class MainWindow(QtWidgets.QMainWindow):
         rotation_center = np.array([self.center_x.value(), self.center_y.value(), self.center_z.value()])
         sod = self.sod_spin.value()
         sdd = sod * self.mag_spin.value()
+        rows, cols = self.rows_spin.value(), self.cols_spin.value()
 
         radius = float(np.max(np.linalg.norm(self.mesh.vertices - rotation_center, axis=1)))
-        if radius >= sod:
+        try:
+            new_pitch = geom.auto_fit_pixel_pitch(radius, sod, sdd, rows, cols)
+        except ValueError:
             QtWidgets.QMessageBox.warning(
                 self,
                 "几何无效",
@@ -703,18 +1002,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "源会跑到模型内部/背面去。请先增大 SOD 或检查旋转中心是否选对了。",
             )
             return
-
-        margin = 1.1  # 10% headroom so the silhouette doesn't sit exactly on the detector edge
-        half_angle = np.arcsin(radius / sod)
-        required_half_extent = sdd * np.tan(half_angle) * margin
-
-        rows, cols = self.rows_spin.value(), self.cols_spin.value()
-        new_pitch = 2.0 * required_half_extent / min(rows, cols)
         self.pixel_pitch_spin.setValue(new_pitch)
 
         self.fov_hint_label.setText(
-            f"模型半径(到旋转中心) {radius:.3f} mm -> 探测器需要覆盖直径 >= {2 * required_half_extent / margin:.3f} mm "
-            f"(已加10%余量) -> 像素尺寸设为 {new_pitch:.5f} mm/px"
+            f"模型半径(到旋转中心) {radius:.3f} mm -> 像素尺寸设为 {new_pitch:.5f} mm/px (已加10%余量)"
         )
         self.log(f"自动适配像素尺寸: {new_pitch:.5f} mm/px (模型半径={radius:.3f}mm, SOD={sod:.3f}mm, SDD={sdd:.3f}mm)")
 
@@ -1030,6 +1321,111 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("序列生成失败:\n" + err)
         QtWidgets.QMessageBox.critical(self, "序列生成失败", err)
 
+    def on_run_batch_experiment(self):
+        n_samples = self.batch_sample_list.count()
+        if n_samples == 0:
+            QtWidgets.QMessageBox.warning(self, "错误", "请先添加至少一个 STL 样品")
+            return
+        out_dir = self.out_dir_edit.text().strip()
+        if not out_dir:
+            QtWidgets.QMessageBox.warning(self, "错误", '请先在"输入 / 输出"里选择输出目录')
+            return
+
+        stl_paths = [self.batch_sample_list.item(i).text() for i in range(n_samples)]
+
+        common = dict(
+            sod=self.sod_spin.value(),
+            sdd=self.sod_spin.value() * self.mag_spin.value(),
+            pixel_pitch=self.pixel_pitch_spin.value(),
+            rows=self.rows_spin.value(),
+            cols=self.cols_spin.value(),
+            mu=self.mu_spin.value(),
+            device=self.device_combo.currentText(),
+            scheme_name=self.scheme_combo.currentText(),
+            auto_fit_fov=self.batch_auto_fit_cb.isChecked(),
+            algorithm=self.recon_algo_combo.currentText(),
+            iterations=self.recon_iters_spin.value(),
+            n_voxels=self.vol_voxels_spin.value(),
+            vol_margin=self.vol_margin_spin.value(),
+        )
+        search_cfg = dict(
+            target_ssim=self.target_ssim_spin.value(),
+            n_init=self.n_init_spin.value(),
+            n_min=self.n_min_spin.value(),
+            n_max=self.n_max_spin.value(),
+            ssim_tol=self.ssim_tol_spin.value(),
+            n_tol=self.n_tol_spin.value(),
+            max_evals=self.max_evals_spin.value(),
+        )
+        shape_ranks = set()
+        if self.batch_shape_metrics_cb.isChecked():
+            shape_ranks = {rank for rank, cb in self.metric_checkboxes.items() if cb.isChecked()}
+
+        self.batch_result_table.setRowCount(0)
+        self.batch_run_btn.setEnabled(False)
+        self.batch_stop_btn.setEnabled(True)
+        self.batch_sample_progress.setRange(0, n_samples)
+        self.batch_sample_progress.setValue(0)
+        self.batch_search_progress.setRange(0, search_cfg["max_evals"])
+        self.batch_search_progress.setValue(0)
+        self.log(f"开始批量实验: {n_samples} 个样品, 目标SSIM={search_cfg['target_ssim']}")
+
+        self.batch_thread = BatchExperimentThread(stl_paths, common, search_cfg, shape_ranks, out_dir)
+        self.batch_thread.sample_progress.connect(self.on_batch_sample_progress)
+        self.batch_thread.search_eval.connect(self.on_batch_search_eval)
+        self.batch_thread.sample_done.connect(self.on_batch_sample_done)
+        self.batch_thread.sample_failed.connect(self.on_batch_sample_failed)
+        self.batch_thread.all_done.connect(self.on_batch_all_done)
+        self.batch_thread.failed.connect(self.on_batch_failed)
+        self.batch_thread.start()
+
+    def on_stop_batch_experiment(self):
+        if self.batch_thread is not None:
+            self.batch_thread.request_cancel()
+            self.log("已请求停止批量实验 (当前样品跑完后停止)")
+            self.batch_stop_btn.setEnabled(False)
+
+    def on_batch_sample_progress(self, index: int, total: int, name: str):
+        self.batch_sample_progress.setValue(index)
+        self.batch_search_progress.setValue(0)
+        self.log(f"批量实验 {index + 1}/{total}: 开始处理样品 {name}")
+
+    def on_batch_search_eval(self, name: str, n: int, score: float, eval_index: int):
+        self.batch_search_progress.setValue(min(eval_index, self.batch_search_progress.maximum()))
+        self.log(f"  [{name}] 第{eval_index}次搜索: N={n} -> SSIM={score:.4f}")
+
+    def _add_batch_result_row(self, name: str, best_n, best_ssim, reached, folder: str):
+        row = self.batch_result_table.rowCount()
+        self.batch_result_table.insertRow(row)
+        values = [name, str(best_n), str(best_ssim), ("是" if reached else "否"), folder]
+        for col, v in enumerate(values):
+            self.batch_result_table.setItem(row, col, QtWidgets.QTableWidgetItem(v))
+
+    def on_batch_sample_done(self, name: str, result: dict):
+        self._add_batch_result_row(
+            name, result["best_n"], f"{result['best_ssim']:.4f}", result["target_reached"], result["folder"]
+        )
+        self.log(
+            f"样品 {name} 完成: N={result['best_n']}, SSIM={result['best_ssim']:.4f}, "
+            f"达标={result['target_reached']}"
+        )
+
+    def on_batch_sample_failed(self, name: str, err: str):
+        self._add_batch_result_row(name, "-", "-", False, "(失败)")
+        self.log(f"样品 {name} 失败:\n{err}")
+
+    def on_batch_all_done(self, summary_path: str):
+        self.batch_sample_progress.setValue(self.batch_sample_progress.maximum())
+        self.batch_run_btn.setEnabled(True)
+        self.batch_stop_btn.setEnabled(False)
+        self.log(f"批量实验全部完成, 汇总见: {summary_path}")
+
+    def on_batch_failed(self, err: str):
+        self.batch_run_btn.setEnabled(True)
+        self.batch_stop_btn.setEnabled(False)
+        self.log("批量实验失败:\n" + err)
+        QtWidgets.QMessageBox.critical(self, "批量实验失败", err)
+
 
 def run_selftest() -> int:
     """Packaged-exe smoke test: actually exercise the GPU/Warp raytracing pipeline,
@@ -1059,7 +1455,25 @@ def run_selftest() -> int:
             raise RuntimeError(f"expected 1 preview thumbnail, got {win.gallery._count}")
 
         device = win.device_combo.currentText()
-        print(f"selftest ok: mesh loaded, GPU/Warp preview generated on device={device}")
+
+        # also exercise the ASTRA reconstruction path -- the other big native-extension
+        # risk in the packaged exe, not covered by the raytracing preview above.
+        import astra
+
+        gpu_info = astra.get_gpu_info()
+        directions = geom.fibonacci_sphere_directions(20)
+        rotation_center = win.mesh.centroid.copy()
+        views = geom.build_all_views(directions, rotation_center, sod=100.0, sdd=200.0)
+        sino = rt.generate_sinogram(win.mesh.vertices, win.mesh.faces, views, 16, 16, 0.5, mu=0.5, device=device)
+        astra_vectors = geom.to_astra_cone_vec(views, rotation_center, 0.5)
+        rec = recon.reconstruct(sino, astra_vectors, 16, 16, vol_half=8.0, n_voxels=16, iterations=5)
+        if rec.shape != (16, 16, 16):
+            raise RuntimeError(f"unexpected reconstruction shape {rec.shape}")
+
+        print(
+            f"selftest ok: mesh loaded, GPU/Warp preview generated on device={device}; "
+            f"ASTRA reconstruction ran ok (GPU: {gpu_info})"
+        )
         return 0
     except Exception:
         traceback.print_exc()

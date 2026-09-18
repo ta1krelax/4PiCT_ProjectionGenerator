@@ -29,7 +29,7 @@ import sys
 NAME = "CT4PiProjector"
 ENTRY = "projector_gui.py"
 
-COLLECT_ALL = ["warp", "trimesh"]
+COLLECT_ALL = ["warp", "trimesh", "astra", "skimage"]
 COLLECT_DATA = ["matplotlib"]
 HIDDEN = [
     "scipy.spatial.transform._rotation_groups",
