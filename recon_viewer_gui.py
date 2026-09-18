@@ -13,9 +13,17 @@ exe doesn't have to bundle Warp's ~350MB JIT toolchain just to look at a volume.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
+
+# See projector_gui.py for why: a --windowed PyInstaller build has sys.stdout/stderr
+# set to None (no console), which crashes any library that unconditionally prints.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+import json
 import traceback
 
 import matplotlib

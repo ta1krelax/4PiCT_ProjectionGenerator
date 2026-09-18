@@ -6,10 +6,21 @@ resolution), then batch-generate a projection dataset ready for ASTRA reconstruc
 
 from __future__ import annotations
 
-import glob
-import json
 import os
 import sys
+
+# PyInstaller's --windowed build has no console, so sys.stdout/stderr are None (not a
+# redirected null stream -- actually None). Any library that unconditionally does
+# sys.stdout.write(...) -- e.g. warp-lang printing its device-info banner at import
+# time -- crashes with "AttributeError: 'NoneType' object has no attribute 'write'".
+# Patch this before importing anything that might print, raytrace_gpu (-> warp) included.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+import glob
+import json
 import time
 import traceback
 
