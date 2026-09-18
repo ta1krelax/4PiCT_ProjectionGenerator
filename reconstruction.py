@@ -16,8 +16,6 @@ import astra
 import numpy as np
 from skimage.metrics import structural_similarity as ssim_fn
 
-import raytrace_gpu as rt
-
 ALGORITHMS = {
     "SIRT3D_CUDA": {"iterative": True, "default_iterations": 100},
     "CGLS3D_CUDA": {"iterative": True, "default_iterations": 50},
@@ -44,7 +42,15 @@ def voxelize_ground_truth(
     vertices: np.ndarray, faces: np.ndarray, vol_half: float, n_voxels: int,
     center: np.ndarray, device: str,
 ) -> np.ndarray:
-    """Binary occupancy ground truth, on the same grid used by `reconstruct`."""
+    """Binary occupancy ground truth, on the same grid used by `reconstruct`.
+
+    Imports raytrace_gpu (and therefore warp-lang) lazily, on first call, so that just
+    importing this module -- e.g. from the lightweight reconstruction-viewer app, which
+    only needs `reconstruct`/`compute_ssim` and never calls this -- doesn't pull in
+    Warp's ~350MB JIT toolchain for nothing.
+    """
+    import raytrace_gpu as rt
+
     projector = rt.GpuProjector(vertices, faces, device)
     points = voxel_grid_centers(vol_half, n_voxels, center)
     occ = projector.occupancy(points)
