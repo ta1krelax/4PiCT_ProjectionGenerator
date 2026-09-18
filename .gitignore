@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# PyInstaller build output (not source; rebuild with build_exe.py)
+build/
+dist/
+
 # generated projection datasets (large binary output, not source)
 *.npy
 projections.npy

@@ -1,6 +1,28 @@
 """4pi view direction sampling and cone-beam geometry construction."""
 
+from __future__ import annotations
+
 import numpy as np
+
+
+def parse_n_sequence(segments: list[tuple[int, int, int]]) -> list[int]:
+    """Merge piecewise (start, end, step) ranges into one sorted, de-duplicated list of N.
+
+    Each segment's own start/end are always included even if `step` does not divide the
+    span evenly, so an explicit boundary the user typed is never silently dropped.
+    """
+    values: set[int] = set()
+    for start, end, step in segments:
+        start, end, step = int(start), int(end), int(step)
+        if step <= 0:
+            raise ValueError(f"步长必须为正整数, 收到 {step}")
+        lo, hi = min(start, end), max(start, end)
+        if lo <= 0:
+            raise ValueError(f"N 必须为正整数, 收到 {lo}")
+        values.update(range(lo, hi + 1, step))
+        values.add(lo)
+        values.add(hi)
+    return sorted(values)
 
 
 def fibonacci_sphere_directions(n: int) -> np.ndarray:

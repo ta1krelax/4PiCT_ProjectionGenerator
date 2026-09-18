@@ -4,3 +4,4 @@ trimesh
 warp-lang
 PySide6
 matplotlib
+networkx

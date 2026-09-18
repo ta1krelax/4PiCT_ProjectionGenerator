@@ -6,8 +6,10 @@ resolution), then batch-generate a projection dataset ready for ASTRA reconstruc
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 import traceback
 
 import matplotlib
@@ -18,6 +20,7 @@ from PySide6 import QtCore, QtWidgets
 import geometry as geom
 import io_utils
 import raytrace_gpu as rt
+import shape_metrics
 from mesh_viewer import MeshViewer3D
 from preview_gallery import PreviewGallery
 from theme import FLAT_QSS
@@ -25,7 +28,7 @@ from theme import FLAT_QSS
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Microsoft JhengHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-RIBBON_SECTIONS = ["输入 / 输出", "旋转中心", "锥束几何", "材料", "采样与设备"]
+RIBBON_SECTIONS = ["输入 / 输出", "旋转中心", "锥束几何", "材料", "采样与设备", "样品评估", "序列生成"]
 
 # preview_direction_combo index -> world-space direction (rotation_center -> source), unit vector.
 # index 0 ("采样方案第1个视角") is handled separately by pulling from the sampling scheme.
@@ -109,6 +112,147 @@ class ScanThread(QtCore.QThread):
             self.failed.emit(traceback.format_exc())
 
 
+class SequenceThread(QtCore.QThread):
+    """Runs the full generation pipeline once per N value in a sweep, unattended.
+
+    Each N gets its own subfolder (out_dir/N_00100/...) so datasets never collide; one
+    failing N is recorded and skipped rather than aborting the whole sweep, and a single
+    compact sequence_summary.json is written at the end for offline review.
+    """
+
+    outer_progress = QtCore.Signal(int, int, int)  # index, total, current_N
+    inner_progress = QtCore.Signal(int, int)  # views done, views total (current N)
+    n_done = QtCore.Signal(int, str, str)  # N, status, folder
+    all_done = QtCore.Signal(str)  # summary_path
+    failed = QtCore.Signal(str)
+
+    def __init__(self, params: dict, n_values: list[int], vertices, faces, stl_path, skip_existing: bool):
+        super().__init__()
+        self.p = params
+        self.n_values = n_values
+        self.vertices = vertices
+        self.faces = faces
+        self.stl_path = stl_path
+        self.skip_existing = skip_existing
+        self._cancel = False
+
+    def request_cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            base_out = self.p["out_dir"]
+            os.makedirs(base_out, exist_ok=True)
+            summary = []
+            total = len(self.n_values)
+
+            for i, n in enumerate(self.n_values):
+                if self._cancel:
+                    summary.append({"n_views": n, "status": "cancelled"})
+                    continue
+
+                self.outer_progress.emit(i, total, n)
+                sub_dir = os.path.join(base_out, f"N_{n:05d}")
+
+                if self.skip_existing and os.path.isfile(os.path.join(sub_dir, "projections.npy")):
+                    self.n_done.emit(n, "skipped_existing", sub_dir)
+                    summary.append({"n_views": n, "status": "skipped_existing", "folder": sub_dir})
+                    continue
+
+                t0 = time.time()
+                try:
+                    scheme_fn = geom.SAMPLING_SCHEMES[self.p["scheme_name"]]
+                    directions = scheme_fn(n)
+                    views = geom.build_all_views(directions, self.p["rotation_center"], self.p["sod"], self.p["sdd"])
+                    chunk_size = max(1, min(25, len(views)))
+
+                    sinogram = rt.generate_sinogram(
+                        self.vertices,
+                        self.faces,
+                        views,
+                        self.p["rows"],
+                        self.p["cols"],
+                        self.p["pixel_pitch"],
+                        self.p["mu"],
+                        self.p["device"],
+                        chunk_size=chunk_size,
+                        progress_cb=lambda done, tot: self.inner_progress.emit(done, tot),
+                    )
+                    astra_vectors = geom.to_astra_cone_vec(views, self.p["rotation_center"], self.p["pixel_pitch"])
+                    meta = {
+                        "stl_path": self.stl_path,
+                        "units": "same as STL file (assumed mm)",
+                        "sampling_scheme": self.p["scheme_name"],
+                        "n_views": n,
+                        "sod_mm": self.p["sod"],
+                        "sdd_mm": self.p["sdd"],
+                        "magnification": self.p["sdd"] / self.p["sod"],
+                        "pixel_pitch_mm": self.p["pixel_pitch"],
+                        "detector_rows": self.p["rows"],
+                        "detector_cols": self.p["cols"],
+                        "mu_per_mm": self.p["mu"],
+                        "rotation_center_mm": list(self.p["rotation_center"]),
+                        "device_used": self.p["device"],
+                    }
+                    io_utils.save_dataset(sub_dir, sinogram, astra_vectors, meta)
+                    elapsed = time.time() - t0
+                    self.n_done.emit(n, "ok", sub_dir)
+                    summary.append({"n_views": n, "status": "ok", "folder": sub_dir, "elapsed_s": round(elapsed, 2)})
+                except Exception:
+                    err = traceback.format_exc()
+                    self.n_done.emit(n, "failed", sub_dir)
+                    summary.append({"n_views": n, "status": "failed", "folder": sub_dir, "error": err})
+
+            summary_path = os.path.join(base_out, "sequence_summary.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "runs": summary},
+                    f, indent=2, ensure_ascii=False, default=str,
+                )
+            self.all_done.emit(summary_path)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ShapeMetricsThread(QtCore.QThread):
+    progress = QtCore.Signal(int, int, str)
+    done = QtCore.Signal(dict, str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, mesh, selected_ranks, n_views, voxel_target, percentile, out_dir, gen_params):
+        super().__init__()
+        self.mesh = mesh
+        self.selected_ranks = selected_ranks
+        self.n_views = n_views
+        self.voxel_target = voxel_target
+        self.percentile = percentile
+        self.out_dir = out_dir
+        self.gen_params = gen_params
+
+    def run(self):
+        try:
+            results = shape_metrics.compute_shape_metrics(
+                self.mesh,
+                self.selected_ranks,
+                n_views=self.n_views,
+                voxel_target=self.voxel_target,
+                percentile=self.percentile,
+                progress_cb=lambda done, total, label: self.progress.emit(done, total, label),
+            )
+            os.makedirs(self.out_dir, exist_ok=True)
+            out_path = os.path.join(self.out_dir, "shape_metrics.json")
+            payload = {
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "generation_parameters": self.gen_params,
+                "shape_metrics": results,
+            }
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+            self.done.emit(results, out_path)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -118,6 +262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mesh: trimesh.Trimesh | None = None
         self.stl_path: str | None = None
         self.scan_thread: ScanThread | None = None
+        self.seq_thread: SequenceThread | None = None
         self._last_directions = None
 
         self._build_ui()
@@ -184,6 +329,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("锥束几何", self._build_geometry_panel),
             ("材料", self._build_material_panel),
             ("采样与设备", self._build_sampling_device_panel),
+            ("样品评估", self._build_shape_eval_panel),
+            ("序列生成", self._build_sequence_panel),
         ]
         self.section_dialogs: list[SectionDialog] = []
         for i, (title, builder) in enumerate(sections):
@@ -366,6 +513,141 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Warp device:", self.device_combo)
 
         return panel
+
+    def _build_shape_eval_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        hint = QtWidgets.QLabel(
+            "样品形态参数评估(用于研究\"4π采样密度\"和\"样品复杂度\"的关系)。\n"
+            "勾选需要计算的参数, 点\"计算并导出\"后连同当前的生成参数一起写入\n"
+            "输出目录下的 shape_metrics.json。定义/算法来源见 shape_metrics.py 顶部注释。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #5b6472; font-size: 11px;")
+        layout.addWidget(hint)
+
+        grid = QtWidgets.QGridLayout()
+        self.metric_checkboxes: dict[int, QtWidgets.QCheckBox] = {}
+        for i, m in enumerate(shape_metrics.METRIC_ORDER):
+            cb = QtWidgets.QCheckBox(f"{m['rank']}. {m['label']}")
+            cb.setChecked(m["default"])
+            self.metric_checkboxes[m["rank"]] = cb
+            grid.addWidget(cb, i // 2, i % 2)
+        layout.addLayout(grid)
+
+        adv_form = QtWidgets.QFormLayout()
+        self.voxel_target_spin = QtWidgets.QSpinBox()
+        self.voxel_target_spin.setRange(16, 256)
+        self.voxel_target_spin.setValue(64)
+        adv_form.addRow("体素分辨率 (最长边体素数, 用于 T5/fractal dimension):", self.voxel_target_spin)
+
+        self.percentile_spin = self._make_spinbox(0.1, 50.0, 5.0)
+        adv_form.addRow("Local thickness 百分位数:", self.percentile_spin)
+        layout.addLayout(adv_form)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.compute_metrics_btn = QtWidgets.QPushButton("计算并导出形态参数")
+        self.compute_metrics_btn.clicked.connect(self.on_compute_shape_metrics)
+        btn_row.addWidget(self.compute_metrics_btn)
+        self.metrics_progress = QtWidgets.QProgressBar()
+        btn_row.addWidget(self.metrics_progress, 1)
+        layout.addLayout(btn_row)
+
+        self.metrics_result_box = QtWidgets.QPlainTextEdit()
+        self.metrics_result_box.setReadOnly(True)
+        self.metrics_result_box.setMinimumHeight(220)
+        layout.addWidget(self.metrics_result_box)
+
+        return panel
+
+    def _build_sequence_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        hint = QtWidgets.QLabel(
+            "批量生成一系列不同\"投影角度数 N\"的数据集(比如做采样密度扫描实验),\n"
+            "不用每次手动改N再点一次生成。填多段(起始N, 结束N, 步长), 会自动合并\n"
+            "去重成一串N值; 每个N单独生成到 out_dir/N_00100/ 这样的子文件夹, 互不覆盖。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #5b6472; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self.seq_table = QtWidgets.QTableWidget(0, 3)
+        self.seq_table.setHorizontalHeaderLabels(["起始 N", "结束 N", "步长"])
+        self.seq_table.horizontalHeader().setStretchLastSection(True)
+        self.seq_table.setMaximumHeight(160)
+        layout.addWidget(self.seq_table)
+        self._add_seq_row(100, 1000, 100)
+        self._add_seq_row(1000, 3000, 200)
+
+        row_btns = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("+ 添加一段")
+        add_btn.clicked.connect(lambda: self._add_seq_row(100, 200, 100))
+        del_btn = QtWidgets.QPushButton("- 删除选中段")
+        del_btn.clicked.connect(self._remove_seq_row)
+        preview_btn = QtWidgets.QPushButton("预览 N 列表")
+        preview_btn.clicked.connect(self.on_preview_n_sequence)
+        row_btns.addWidget(add_btn)
+        row_btns.addWidget(del_btn)
+        row_btns.addWidget(preview_btn)
+        layout.addLayout(row_btns)
+
+        self.seq_preview_label = QtWidgets.QLabel("")
+        self.seq_preview_label.setWordWrap(True)
+        layout.addWidget(self.seq_preview_label)
+
+        self.seq_skip_existing = QtWidgets.QCheckBox("跳过已生成过的N (按子文件夹里是否已有 projections.npy 判断, 方便中断后续跑)")
+        self.seq_skip_existing.setChecked(True)
+        layout.addWidget(self.seq_skip_existing)
+
+        run_row = QtWidgets.QHBoxLayout()
+        self.seq_run_btn = QtWidgets.QPushButton("开始批量生成序列")
+        self.seq_run_btn.setObjectName("primaryAction")
+        self.seq_run_btn.clicked.connect(self.on_run_sequence)
+        self.seq_stop_btn = QtWidgets.QPushButton("停止")
+        self.seq_stop_btn.setEnabled(False)
+        self.seq_stop_btn.clicked.connect(self.on_stop_sequence)
+        run_row.addWidget(self.seq_run_btn)
+        run_row.addWidget(self.seq_stop_btn)
+        layout.addLayout(run_row)
+
+        prog_form = QtWidgets.QFormLayout()
+        self.seq_outer_progress = QtWidgets.QProgressBar()
+        prog_form.addRow("总进度 (第几个 N):", self.seq_outer_progress)
+        self.seq_inner_progress = QtWidgets.QProgressBar()
+        prog_form.addRow("当前 N 内部进度:", self.seq_inner_progress)
+        layout.addLayout(prog_form)
+
+        return panel
+
+    def _add_seq_row(self, start: int, end: int, step: int):
+        row = self.seq_table.rowCount()
+        self.seq_table.insertRow(row)
+        for col, val in enumerate([start, end, step]):
+            item = QtWidgets.QTableWidgetItem(str(val))
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.seq_table.setItem(row, col, item)
+
+    def _remove_seq_row(self):
+        row = self.seq_table.currentRow()
+        if row >= 0:
+            self.seq_table.removeRow(row)
+
+    def _parse_seq_table(self) -> list[int]:
+        segments = []
+        for row in range(self.seq_table.rowCount()):
+            try:
+                start = int(self.seq_table.item(row, 0).text())
+                end = int(self.seq_table.item(row, 1).text())
+                step = int(self.seq_table.item(row, 2).text())
+            except (AttributeError, ValueError):
+                raise ValueError(f"第 {row + 1} 行填的不是有效整数")
+            segments.append((start, end, step))
+        if not segments:
+            raise ValueError("请至少填一段 (起始N, 结束N, 步长)")
+        return geom.parse_n_sequence(segments)
 
     @staticmethod
     def _wrap(inner_layout: QtWidgets.QLayout) -> QtWidgets.QWidget:
@@ -581,6 +863,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gallery.add_preview(image, meta)
         self.log(f"生成单张投影预览 (方案: {scheme_label}, 方向: {meta['direction']})")
 
+    def on_compute_shape_metrics(self):
+        if self.mesh is None:
+            QtWidgets.QMessageBox.warning(self, "错误", "请先加载 STL 模型")
+            return
+        try:
+            p = self._gather_common_params()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "参数错误", str(exc))
+            return
+
+        selected = {rank for rank, cb in self.metric_checkboxes.items() if cb.isChecked()}
+        if not selected:
+            QtWidgets.QMessageBox.warning(self, "错误", "请至少勾选一个参数")
+            return
+
+        gen_params = dict(p)
+        gen_params["rotation_center"] = gen_params["rotation_center"].tolist()
+        gen_params["stl_path"] = self.stl_path
+
+        self.compute_metrics_btn.setEnabled(False)
+        self.metrics_progress.setRange(0, len(selected))
+        self.metrics_progress.setValue(0)
+        self.metrics_result_box.setPlainText("计算中...")
+
+        self.metrics_thread = ShapeMetricsThread(
+            self.mesh,
+            selected,
+            p["n_views"],
+            self.voxel_target_spin.value(),
+            self.percentile_spin.value(),
+            p["out_dir"],
+            gen_params,
+        )
+        self.metrics_thread.progress.connect(self.on_metrics_progress)
+        self.metrics_thread.done.connect(self.on_metrics_done)
+        self.metrics_thread.failed.connect(self.on_metrics_failed)
+        self.metrics_thread.start()
+
+    def on_metrics_progress(self, done: int, total: int, label: str):
+        self.metrics_progress.setValue(done)
+        self.log(f"计算形态参数: {label} ({done}/{total})")
+
+    def on_metrics_done(self, results: dict, out_path: str):
+        self.compute_metrics_btn.setEnabled(True)
+        self.metrics_result_box.setPlainText(json.dumps(results, indent=2, ensure_ascii=False, default=str))
+        self.log(f"形态参数计算完成, 已导出到: {out_path}")
+
+    def on_metrics_failed(self, err: str):
+        self.compute_metrics_btn.setEnabled(True)
+        self.metrics_result_box.setPlainText("计算失败:\n" + err)
+        self.log("形态参数计算失败:\n" + err)
+        QtWidgets.QMessageBox.critical(self, "计算失败", err)
+
     def on_run_full_scan(self):
         try:
             p = self._gather_common_params()
@@ -622,8 +957,121 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_btn.setEnabled(True)
         self.preview_btn.setEnabled(True)
 
+    def on_preview_n_sequence(self):
+        try:
+            values = self._parse_seq_table()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "参数错误", str(exc))
+            return
+        self.seq_preview_label.setText(f"共 {len(values)} 个 N 值: {values}")
+
+    def on_run_sequence(self):
+        if self.mesh is None:
+            QtWidgets.QMessageBox.warning(self, "错误", "请先加载 STL 模型")
+            return
+        try:
+            p = self._gather_common_params()
+            n_values = self._parse_seq_table()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "参数错误", str(exc))
+            return
+
+        self.seq_run_btn.setEnabled(False)
+        self.seq_stop_btn.setEnabled(True)
+        self.run_btn.setEnabled(False)
+        self.preview_btn.setEnabled(False)
+        self.seq_outer_progress.setRange(0, len(n_values))
+        self.seq_outer_progress.setValue(0)
+        self.seq_inner_progress.setValue(0)
+        self.log(f"开始批量序列生成: {len(n_values)} 个 N 值 {n_values}")
+
+        self.seq_thread = SequenceThread(
+            p, n_values, self.mesh.vertices, self.mesh.faces, self.stl_path,
+            self.seq_skip_existing.isChecked(),
+        )
+        self.seq_thread.outer_progress.connect(self.on_seq_outer_progress)
+        self.seq_thread.inner_progress.connect(self.on_seq_inner_progress)
+        self.seq_thread.n_done.connect(self.on_seq_n_done)
+        self.seq_thread.all_done.connect(self.on_seq_all_done)
+        self.seq_thread.failed.connect(self.on_seq_failed)
+        self.seq_thread.start()
+
+    def on_stop_sequence(self):
+        if self.seq_thread is not None:
+            self.seq_thread.request_cancel()
+            self.log("已请求停止序列生成 (当前 N 跑完后停止, 不会中断到一半)")
+            self.seq_stop_btn.setEnabled(False)
+
+    def on_seq_outer_progress(self, index: int, total: int, n: int):
+        self.seq_outer_progress.setValue(index)
+        self.seq_inner_progress.setValue(0)
+        self.log(f"序列进度 {index + 1}/{total}: 开始生成 N={n}")
+
+    def on_seq_inner_progress(self, done: int, total: int):
+        self.seq_inner_progress.setRange(0, total)
+        self.seq_inner_progress.setValue(done)
+
+    def on_seq_n_done(self, n: int, status: str, folder: str):
+        self.log(f"N={n} -> {status} ({folder})")
+
+    def on_seq_all_done(self, summary_path: str):
+        self.seq_outer_progress.setValue(self.seq_outer_progress.maximum())
+        self.seq_run_btn.setEnabled(True)
+        self.seq_stop_btn.setEnabled(False)
+        self.run_btn.setEnabled(True)
+        self.preview_btn.setEnabled(True)
+        self.log(f"序列生成全部完成, 汇总见: {summary_path}")
+
+    def on_seq_failed(self, err: str):
+        self.seq_run_btn.setEnabled(True)
+        self.seq_stop_btn.setEnabled(False)
+        self.run_btn.setEnabled(True)
+        self.preview_btn.setEnabled(True)
+        self.log("序列生成失败:\n" + err)
+        QtWidgets.QMessageBox.critical(self, "序列生成失败", err)
+
+
+def run_selftest() -> int:
+    """Packaged-exe smoke test: actually exercise the GPU/Warp raytracing pipeline,
+    not just "the window opened". Used by build_exe.py right after packaging.
+    """
+    import tempfile
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(FLAT_QSS)
+    win = MainWindow()
+    try:
+        mesh = trimesh.creation.box(extents=[10.0, 8.0, 6.0])
+        stl_path = os.path.join(tempfile.gettempdir(), "ct4pi_selftest.stl")
+        mesh.export(stl_path)
+
+        win.stl_path_edit.setText(stl_path)
+        win.out_dir_edit.setText(os.path.join(tempfile.gettempdir(), "ct4pi_selftest_out"))
+        win.on_load_mesh()
+        if win.mesh is None:
+            raise RuntimeError("mesh failed to load")
+
+        win.rows_spin.setValue(16)
+        win.cols_spin.setValue(16)
+        win.on_preview_projection()
+        if win.gallery._count != 1:
+            raise RuntimeError(f"expected 1 preview thumbnail, got {win.gallery._count}")
+
+        device = win.device_combo.currentText()
+        print(f"selftest ok: mesh loaded, GPU/Warp preview generated on device={device}")
+        return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+    finally:
+        win.close()
+
 
 def main():
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(run_selftest())
+
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(FLAT_QSS)
     win = MainWindow()
