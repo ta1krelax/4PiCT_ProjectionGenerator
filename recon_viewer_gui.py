@@ -21,6 +21,7 @@ import traceback
 import matplotlib
 import numpy as np
 from PySide6 import QtCore, QtWidgets
+from skimage.filters import threshold_otsu
 
 import reconstruction as recon
 from mesh_viewer import MeshViewer3D
@@ -67,6 +68,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("CT Reconstruction Viewer")
         self.resize(1320, 880)
         self.volume: np.ndarray | None = None
+        self.voxel_pitch: float = 1.0
         self.recon_thread: ReconstructThread | None = None
         self._build_ui()
         self.statusBar().showMessage("就绪")
@@ -79,7 +81,7 @@ class MainWindow(QtWidgets.QMainWindow):
         root.addWidget(self._build_sidebar(), 0)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.viewer3d = MeshViewer3D()
+        self.viewer3d = MeshViewer3D(show_grid=False)
         self.slice_viewer = SliceViewer()
         splitter.addWidget(self.viewer3d)
         splitter.addWidget(self.slice_viewer)
@@ -95,10 +97,15 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(content)
 
         load_group = QtWidgets.QGroupBox("导入重构后的三维模型 (.npy)")
-        load_layout = QtWidgets.QVBoxLayout(load_group)
+        load_layout = QtWidgets.QFormLayout(load_group)
+        self.raw_pitch_spin = QtWidgets.QDoubleSpinBox()
+        self.raw_pitch_spin.setRange(1.0e-6, 1.0e6)
+        self.raw_pitch_spin.setDecimals(6)
+        self.raw_pitch_spin.setValue(1.0)
+        load_layout.addRow("体素物理尺寸 (mm/voxel):", self.raw_pitch_spin)
         load_btn = QtWidgets.QPushButton("浏览并加载...")
         load_btn.clicked.connect(self.on_load_volume_file)
-        load_layout.addWidget(load_btn)
+        load_layout.addRow(load_btn)
         layout.addWidget(load_group)
 
         recon_group = QtWidgets.QGroupBox("导入投影/切片数据集进行重建")
@@ -184,6 +191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if volume.ndim != 3:
             QtWidgets.QMessageBox.warning(self, "错误", f"期望一个3维体积数组, 收到 shape={volume.shape}")
             return
+        self.voxel_pitch = self.raw_pitch_spin.value()
         self._set_volume(volume, f"已加载: {path}")
 
     def on_browse_dataset(self):
@@ -212,6 +220,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_recon_done(self, volume: np.ndarray, dataset_dir: str):
         self.recon_btn.setEnabled(True)
         self.log("重建完成")
+        self.voxel_pitch = 2.0 * self.vol_half_spin.value() / self.voxels_spin.value()
         self._set_volume(volume, f"重建完成: {dataset_dir}")
 
     def on_recon_failed(self, err: str):
@@ -225,17 +234,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(
             f"{status_text}\n体积形状: {volume.shape}, 值范围: [{volume.min():.4f}, {volume.max():.4f}]"
         )
+
+        lo, hi = float(volume.min()), float(volume.max())
+        default_level = self._default_threshold(volume, lo, hi)
+        tick = int(np.clip((default_level - lo) / (hi - lo), 0.001, 0.999) * THRESHOLD_STEPS) if hi > lo else THRESHOLD_STEPS // 2
+        self.threshold_slider.blockSignals(True)
+        self.threshold_slider.setValue(tick)
+        self.threshold_slider.blockSignals(False)
         self.on_threshold_changed()
+
+    @staticmethod
+    def _default_threshold(volume: np.ndarray, lo: float, hi: float) -> float:
+        """Otsu's method: pick the level that best separates two populations (e.g.
+        background vs. object) instead of a naive min/max midpoint, which a handful of
+        extreme outlier voxels (common at reconstruction boundaries/artifacts) can pull
+        far away from where the actual object sits.
+        """
+        try:
+            return float(threshold_otsu(volume))
+        except Exception:
+            return lo + 0.5 * (hi - lo)
+
+    def _current_level(self) -> float:
+        lo, hi = float(self.volume.min()), float(self.volume.max())
+        frac = self.threshold_slider.value() / THRESHOLD_STEPS
+        return lo + frac * (hi - lo)
 
     def on_threshold_changed(self):
         if self.volume is None:
             return
         lo, hi = float(self.volume.min()), float(self.volume.max())
-        frac = self.threshold_slider.value() / THRESHOLD_STEPS
-        level = lo + frac * (hi - lo)
+        level = self._current_level()
         self.threshold_label.setText(f"阈值 = {level:.4f}  (体积值范围 {lo:.4f} ~ {hi:.4f})")
 
-        mesh = extract_isosurface(self.volume, level)
+        mesh = extract_isosurface(self.volume, level, self.voxel_pitch)
         if mesh is None or len(mesh.faces) == 0:
             self.viewer3d.mesh = None
             self.viewer3d.redraw()
@@ -248,10 +280,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存为 STL", "", "STL Files (*.stl)")
         if not path:
             return
-        lo, hi = float(self.volume.min()), float(self.volume.max())
-        frac = self.threshold_slider.value() / THRESHOLD_STEPS
-        level = lo + frac * (hi - lo)
-        mesh = extract_isosurface(self.volume, level)
+        mesh = extract_isosurface(self.volume, self._current_level(), self.voxel_pitch)
         if mesh is None:
             QtWidgets.QMessageBox.warning(self, "错误", "当前阈值下没有等值面, 无法导出")
             return

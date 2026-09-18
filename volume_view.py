@@ -11,13 +11,17 @@ from skimage import measure
 
 
 def extract_isosurface(volume: np.ndarray, level: float, voxel_pitch: float = 1.0) -> trimesh.Trimesh | None:
-    """Marching-cubes isosurface at `level`. Returns None if `level` is outside the
-    volume's actual value range (marching_cubes raises in that case)."""
+    """Marching-cubes isosurface at `level`, scaled to physical units and centered on
+    the origin (matching this project's reconstruction-volume convention: vol_geom is
+    always symmetric about 0). Returns None if `level` is outside the volume's actual
+    value range (marching_cubes raises in that case).
+    """
     lo, hi = float(volume.min()), float(volume.max())
     if not (lo < level < hi):
         return None
     verts, faces, _normals, _values = measure.marching_cubes(volume, level=level)
-    verts = verts * voxel_pitch
+    half_extent = np.asarray(volume.shape, dtype=np.float64) * voxel_pitch / 2.0
+    verts = verts * voxel_pitch - half_extent
     return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
