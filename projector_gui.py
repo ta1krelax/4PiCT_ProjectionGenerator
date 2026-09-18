@@ -16,6 +16,8 @@ import traceback
 import matplotlib
 import numpy as np
 import trimesh
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 from PySide6 import QtCore, QtWidgets
 
 import geometry as geom
@@ -32,7 +34,8 @@ matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Microsof
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 RIBBON_SECTIONS = [
-    "输入 / 输出", "旋转中心", "锥束几何", "材料", "采样与设备", "样品评估", "序列生成", "批量实验(N搜索)",
+    "输入 / 输出", "旋转中心", "锥束几何", "材料", "采样与设备", "样品评估",
+    "序列生成", "单次重建实验", "批量实验(N搜索)",
 ]
 
 # preview_direction_combo index -> world-space direction (rotation_center -> source), unit vector.
@@ -411,6 +414,86 @@ class BatchExperimentThread(QtCore.QThread):
         return result
 
 
+class SingleExperimentThread(QtCore.QThread):
+    """One reconstruction + (if a mesh is available) one SSIM against ground truth --
+    for quickly sanity-checking the reconstruction algorithm / tuning its parameters
+    against data that may already have been exported (e.g. a previous N=3000 run),
+    without going through the full adaptive-search batch pipeline.
+    """
+
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, mode: str, params: dict):
+        super().__init__()
+        self.mode = mode  # "generate" or "load_dataset"
+        self.p = params
+
+    def run(self):
+        try:
+            p = self.p
+            vertices = faces = None
+            rotation_center = None
+
+            if self.mode == "generate":
+                mesh = p["mesh"]
+                rotation_center = p["rotation_center"]
+                directions = geom.SAMPLING_SCHEMES[p["scheme_name"]](p["n_views"])
+                views = geom.build_all_views(directions, rotation_center, p["sod"], p["sdd"])
+                sino = rt.generate_sinogram(
+                    mesh.vertices, mesh.faces, views, p["rows"], p["cols"], p["pixel_pitch"], p["mu"],
+                    p["device"], chunk_size=max(1, min(25, len(views))),
+                )
+                astra_vectors = geom.to_astra_cone_vec(views, rotation_center, p["pixel_pitch"])
+                rows, cols, mu = p["rows"], p["cols"], p["mu"]
+                vertices, faces = mesh.vertices, mesh.faces
+            else:
+                dataset_dir = p["dataset_dir"]
+                sino = np.load(os.path.join(dataset_dir, "projections.npy"))
+                astra_vectors = np.load(os.path.join(dataset_dir, "astra_vectors.npy"))
+                with open(os.path.join(dataset_dir, "metadata.json"), encoding="utf-8") as f:
+                    meta = json.load(f)
+                rows, cols = meta["detector_rows"], meta["detector_cols"]
+                mu = meta["mu_per_mm"]
+                rotation_center = np.array(meta["rotation_center_mm"])
+                stl_path = meta.get("stl_path")
+                if stl_path and os.path.isfile(stl_path):
+                    loaded = trimesh.load(stl_path, force="mesh")
+                    vertices, faces = loaded.vertices, loaded.faces
+
+            vol_half = p["vol_half"]
+            if p["auto_vol_half"] and vertices is not None:
+                radius = float(np.max(np.linalg.norm(vertices - rotation_center, axis=1)))
+                vol_half = recon.default_vol_half(radius, margin=p["vol_margin"])
+
+            rec = recon.reconstruct(
+                sino, astra_vectors, rows, cols, vol_half, p["n_voxels"],
+                algorithm=p["algorithm"], iterations=p["iterations"],
+            )
+
+            ground_truth = None
+            ssim_score = None
+            if vertices is not None:
+                ground_truth = recon.voxelize_ground_truth(vertices, faces, vol_half, p["n_voxels"], rotation_center, p["device"])
+                ssim_score = recon.compute_ssim(ground_truth, rec, mu)
+
+            self.done.emit({
+                "reconstruction": rec,
+                "ground_truth": ground_truth,
+                "ssim": ssim_score,
+                "sino": sino,
+                "astra_vectors": astra_vectors,
+                "rows": rows, "cols": cols, "mu": mu,
+                "n_views": int(sino.shape[0]),
+                "vol_half": vol_half,
+                "n_voxels": p["n_voxels"],
+                "algorithm": p["algorithm"],
+                "iterations": p["iterations"],
+            })
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -422,6 +505,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_thread: ScanThread | None = None
         self.seq_thread: SequenceThread | None = None
         self.batch_thread: "BatchExperimentThread | None" = None
+        self.single_thread: "SingleExperimentThread | None" = None
+        self._single_result: dict | None = None
         self._last_directions = None
 
         self._build_ui()
@@ -490,6 +575,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("采样与设备", self._build_sampling_device_panel),
             ("样品评估", self._build_shape_eval_panel),
             ("序列生成", self._build_sequence_panel),
+            ("单次重建实验", self._build_single_experiment_panel),
             ("批量实验(N搜索)", self._build_batch_experiment_panel),
         ]
         self.section_dialogs: list[SectionDialog] = []
@@ -809,6 +895,107 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("请至少填一段 (起始N, 结束N, 步长)")
         return geom.parse_n_sequence(segments)
 
+    def _build_single_experiment_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        hint = QtWidgets.QLabel(
+            "跑一次\"生成(可选) -> ASTRA重建 -> 算SSIM\", 不做N搜索, 用来快速验证重建\n"
+            "算法或调重建参数（算法/迭代次数/体素分辨率）看效果。可以直接用当前加载的\n"
+            "模型生成一个指定N, 也可以直接加载之前用\"生成全部4π投影\"/\"序列生成\"/\n"
+            "\"批量实验\"导出过的数据集文件夹（比如你已经导出的N=3000那份), 跳过重新生成。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #5b6472; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self.single_source_group = QtWidgets.QButtonGroup(self)
+        self.single_rb_generate = QtWidgets.QRadioButton("使用当前加载的模型直接生成")
+        self.single_rb_dataset = QtWidgets.QRadioButton("从已导出的数据集文件夹加载 (projections.npy 等)")
+        self.single_rb_generate.setChecked(True)
+        self.single_source_group.addButton(self.single_rb_generate, 0)
+        self.single_source_group.addButton(self.single_rb_dataset, 1)
+        self.single_source_group.idClicked.connect(self._on_single_source_changed)
+        layout.addWidget(self.single_rb_generate)
+        layout.addWidget(self.single_rb_dataset)
+
+        gen_form = QtWidgets.QFormLayout()
+        self.single_n_spin = QtWidgets.QSpinBox()
+        self.single_n_spin.setRange(1, 200000)
+        self.single_n_spin.setValue(1000)
+        gen_form.addRow("投影角度数 N:", self.single_n_spin)
+        layout.addLayout(gen_form)
+
+        dataset_row = QtWidgets.QHBoxLayout()
+        self.single_dataset_edit = QtWidgets.QLineEdit()
+        self.single_dataset_edit.setEnabled(False)
+        dataset_btn = QtWidgets.QPushButton("浏览...")
+        dataset_btn.clicked.connect(self.on_browse_single_dataset)
+        dataset_row.addWidget(self.single_dataset_edit)
+        dataset_row.addWidget(dataset_btn)
+        self.single_dataset_row_widget = self._wrap(dataset_row)
+        self.single_dataset_row_widget.setEnabled(False)
+        layout.addWidget(self.single_dataset_row_widget)
+
+        recon_form = QtWidgets.QFormLayout()
+        self.single_algo_combo = QtWidgets.QComboBox()
+        self.single_algo_combo.addItems(list(recon.ALGORITHMS.keys()))
+        recon_form.addRow("重建算法:", self.single_algo_combo)
+
+        self.single_iters_spin = QtWidgets.QSpinBox()
+        self.single_iters_spin.setRange(1, 10000)
+        self.single_iters_spin.setValue(100)
+        recon_form.addRow("迭代次数 (仅迭代算法):", self.single_iters_spin)
+
+        self.single_voxels_spin = QtWidgets.QSpinBox()
+        self.single_voxels_spin.setRange(16, 512)
+        self.single_voxels_spin.setValue(96)
+        recon_form.addRow("重建体素分辨率:", self.single_voxels_spin)
+
+        self.single_vol_margin_spin = self._make_spinbox(1.0, 3.0, 1.3)
+        recon_form.addRow("体积边界余量 (自动模式用):", self.single_vol_margin_spin)
+
+        self.single_vol_half_spin = self._make_spinbox(0.001, 1e6, 10.0)
+        self.single_vol_half_spin.setEnabled(False)
+        recon_form.addRow("体积半宽 mm (手动模式用):", self.single_vol_half_spin)
+        layout.addLayout(recon_form)
+
+        self.single_auto_vol_cb = QtWidgets.QCheckBox("自动计算体积范围 (按样品半径 x 余量; 没有可用模型时用手动体积半宽)")
+        self.single_auto_vol_cb.setChecked(True)
+        self.single_auto_vol_cb.toggled.connect(lambda checked: self.single_vol_half_spin.setEnabled(not checked))
+        layout.addWidget(self.single_auto_vol_cb)
+
+        run_row = QtWidgets.QHBoxLayout()
+        self.single_run_btn = QtWidgets.QPushButton("运行单次重建")
+        self.single_run_btn.setObjectName("primaryAction")
+        self.single_run_btn.clicked.connect(self.on_run_single_experiment)
+        self.single_save_btn = QtWidgets.QPushButton("保存结果到...")
+        self.single_save_btn.setEnabled(False)
+        self.single_save_btn.clicked.connect(self.on_save_single_result)
+        run_row.addWidget(self.single_run_btn)
+        run_row.addWidget(self.single_save_btn)
+        layout.addLayout(run_row)
+
+        self.single_status_label = QtWidgets.QLabel("尚未运行")
+        self.single_status_label.setWordWrap(True)
+        layout.addWidget(self.single_status_label)
+
+        self.single_fig = Figure(figsize=(7, 4.5))
+        self.single_canvas = FigureCanvas(self.single_fig)
+        layout.addWidget(self.single_canvas)
+
+        return panel
+
+    def _on_single_source_changed(self, idx: int):
+        generate_mode = idx == 0
+        self.single_n_spin.setEnabled(generate_mode)
+        self.single_dataset_row_widget.setEnabled(not generate_mode)
+
+    def on_browse_single_dataset(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "选择包含 projections.npy 的数据集文件夹")
+        if folder:
+            self.single_dataset_edit.setText(folder)
+
     def _build_batch_experiment_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
@@ -981,9 +1168,10 @@ class MainWindow(QtWidgets.QMainWindow):
         mag = self.mag_spin.value()
         self.sdd_label.setText(f"{sod * mag:.4f}")
 
-    def on_auto_fit_fov(self):
+    def on_auto_fit_fov(self, silent: bool = False):
         if self.mesh is None:
-            QtWidgets.QMessageBox.warning(self, "错误", "请先加载 STL 模型")
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "错误", "请先加载 STL 模型")
             return
 
         rotation_center = np.array([self.center_x.value(), self.center_y.value(), self.center_z.value()])
@@ -995,12 +1183,14 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             new_pitch = geom.auto_fit_pixel_pitch(radius, sod, sdd, rows, cols)
         except ValueError:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "几何无效",
+            msg = (
                 f"模型上离旋转中心最远的点 ({radius:.3f} mm) 已经超出了 SOD ({sod:.3f} mm)，"
-                "源会跑到模型内部/背面去。请先增大 SOD 或检查旋转中心是否选对了。",
+                "源会跑到模型内部/背面去。请先增大 SOD 或检查旋转中心是否选对了。"
             )
+            if silent:
+                self.log(f"自动适配像素尺寸: 跳过 ({msg})")
+            else:
+                QtWidgets.QMessageBox.warning(self, "几何无效", msg)
             return
         self.pixel_pitch_spin.setValue(new_pitch)
 
@@ -1074,12 +1264,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewer.set_mesh(mesh, mesh.centroid)
         self.on_center_mode_changed(self.center_mode_group.checkedId())
         self.log(f"已加载模型: {path}")
+        self.on_auto_fit_fov(silent=True)
 
-    def _gather_common_params(self):
+    def _gather_common_params(self, require_out_dir: bool = True):
         if self.mesh is None:
             raise ValueError("请先加载 STL 模型")
         out_dir = self.out_dir_edit.text().strip()
-        if not out_dir:
+        if require_out_dir and not out_dir:
             raise ValueError("请先选择输出目录")
 
         rotation_center = np.array([self.center_x.value(), self.center_y.value(), self.center_z.value()])
@@ -1320,6 +1511,112 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_btn.setEnabled(True)
         self.log("序列生成失败:\n" + err)
         QtWidgets.QMessageBox.critical(self, "序列生成失败", err)
+
+    def on_run_single_experiment(self):
+        mode = "generate" if self.single_source_group.checkedId() == 0 else "load_dataset"
+
+        params = dict(
+            algorithm=self.single_algo_combo.currentText(),
+            iterations=self.single_iters_spin.value(),
+            n_voxels=self.single_voxels_spin.value(),
+            vol_margin=self.single_vol_margin_spin.value(),
+            auto_vol_half=self.single_auto_vol_cb.isChecked(),
+            vol_half=self.single_vol_half_spin.value(),
+        )
+
+        if mode == "generate":
+            try:
+                p = self._gather_common_params(require_out_dir=False)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "参数错误", str(exc))
+                return
+            params.update(
+                mesh=self.mesh,
+                rotation_center=p["rotation_center"],
+                sod=p["sod"], sdd=p["sdd"], pixel_pitch=p["pixel_pitch"],
+                rows=p["rows"], cols=p["cols"], mu=p["mu"], device=p["device"],
+                scheme_name=p["scheme_name"], n_views=self.single_n_spin.value(),
+            )
+        else:
+            dataset_dir = self.single_dataset_edit.text().strip()
+            if not dataset_dir or not os.path.isfile(os.path.join(dataset_dir, "projections.npy")):
+                QtWidgets.QMessageBox.warning(self, "错误", "请先选一个包含 projections.npy 的数据集文件夹")
+                return
+            params.update(dataset_dir=dataset_dir, device=self.device_combo.currentText())
+
+        self.single_run_btn.setEnabled(False)
+        self.single_save_btn.setEnabled(False)
+        self.single_status_label.setText("运行中...")
+        self.log(f"开始单次重建实验 (模式: {mode})")
+
+        self.single_thread = SingleExperimentThread(mode, params)
+        self.single_thread.done.connect(self.on_single_done)
+        self.single_thread.failed.connect(self.on_single_failed)
+        self.single_thread.start()
+
+    def on_single_done(self, result: dict):
+        self._single_result = result
+        self.single_run_btn.setEnabled(True)
+        self.single_save_btn.setEnabled(True)
+
+        ssim_text = f"{result['ssim']:.4f}" if result["ssim"] is not None else "无法计算 (没有可用的原始模型做ground truth)"
+        self.single_status_label.setText(
+            f"N={result['n_views']}  算法={result['algorithm']}  迭代={result['iterations']}  "
+            f"体素分辨率={result['n_voxels']}  体积半宽={result['vol_half']:.3f}mm  SSIM={ssim_text}"
+        )
+        self.log(f"单次重建完成: N={result['n_views']}, SSIM={ssim_text}")
+        self._draw_single_result(result)
+
+    def on_single_failed(self, err: str):
+        self.single_run_btn.setEnabled(True)
+        self.single_save_btn.setEnabled(False)
+        self.single_status_label.setText("运行失败, 详情见日志")
+        self.log("单次重建实验失败:\n" + err)
+        QtWidgets.QMessageBox.critical(self, "单次重建实验失败", err)
+
+    def _draw_single_result(self, result: dict):
+        rec = result["reconstruction"]
+        gt = result["ground_truth"]
+        mid = rec.shape[0] // 2
+
+        self.single_fig.clear()
+        n_rows = 2 if gt is not None else 1
+        axes = self.single_fig.subplots(n_rows, 3, squeeze=False)
+
+        slices = [rec[mid, :, :], rec[:, mid, :], rec[:, :, mid]]
+        titles = ["重建 XY 切片", "重建 XZ 切片", "重建 YZ 切片"]
+        for col, (img, title) in enumerate(zip(slices, titles)):
+            ax = axes[0][col]
+            ax.imshow(img, cmap="gray")
+            ax.set_title(title, fontsize=9)
+            ax.axis("off")
+
+        if gt is not None:
+            gt_slices = [gt[mid, :, :], gt[:, mid, :], gt[:, :, mid]]
+            gt_titles = ["Ground truth XY", "Ground truth XZ", "Ground truth YZ"]
+            for col, (img, title) in enumerate(zip(gt_slices, gt_titles)):
+                ax = axes[1][col]
+                ax.imshow(img, cmap="gray")
+                ax.set_title(title, fontsize=9)
+                ax.axis("off")
+
+        self.single_fig.tight_layout()
+        self.single_canvas.draw()
+
+    def on_save_single_result(self):
+        if self._single_result is None:
+            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "选择保存目录")
+        if not folder:
+            return
+        result = self._single_result
+        np.save(os.path.join(folder, "reconstruction.npy"), result["reconstruction"].astype(np.float32))
+        if result["ground_truth"] is not None:
+            np.save(os.path.join(folder, "ground_truth.npy"), result["ground_truth"].astype(np.uint8))
+        summary = {k: v for k, v in result.items() if k not in ("reconstruction", "ground_truth", "sino", "astra_vectors")}
+        with open(os.path.join(folder, "single_experiment_result.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
+        self.log(f"单次重建结果已保存到: {folder}")
 
     def on_run_batch_experiment(self):
         n_samples = self.batch_sample_list.count()
