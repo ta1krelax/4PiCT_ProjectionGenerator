@@ -5,12 +5,14 @@
     .venv\\Scripts\\python.exe build_recon_viewer_exe.py            # 文件夹版
     .venv\\Scripts\\python.exe build_recon_viewer_exe.py --onefile   # 单文件 exe
 
-这个跟 build_exe.py (投影生成器) 是两个独立的打包目标——故意**不** collect warp,
-这个查看器本身完全不需要GPU光追/STL切片, 只需要ASTRA重建+skimage等值面提取,
-所以体积应该比投影生成器那个exe小不少 (省掉warp-lang自带的~350MB JIT工具链)。
+这个跟 build_exe.py (投影生成器) 是两个独立的打包目标。加了"跟参考STL算SSIM"
+功能之后, 这个查看器又需要Warp做GPU ground truth占据判定了 (`--collect-all warp`
+重新加回来), 所以体积不再比投影生成器小太多——省不掉Warp那部分了；如果你不用
+SSIM功能(只是导入/重建/看等值面), Warp的JIT编译器不会被触发, 但exe本身还是
+带着它。
 
-打完之后自己跑一遍 `exe --selftest`（真的做一次等值面提取+一次ASTRA重建, 不是
-只看窗口能不能开）。
+打完之后自己跑一遍 `exe --selftest`（真的做一次等值面提取+一次ASTRA重建+一次
+跟合成参考网格的SSIM对比, 不是只看窗口能不能开）。
 """
 
 import argparse
@@ -22,10 +24,14 @@ import sys
 NAME = "CT4PiReconViewer"
 ENTRY = "recon_viewer_gui.py"
 
-COLLECT_ALL = ["trimesh", "astra", "skimage"]
+COLLECT_ALL = ["trimesh", "astra", "skimage", "warp"]
 COLLECT_DATA = ["matplotlib"]
 HIDDEN = [
     "scipy.spatial.transform._rotation_groups",
+]
+EXCLUDE = [
+    "warp.tests", "warp.examples", "warp.jax_experimental", "warp.render",
+    "warp.fem", "warp.sim",
 ]
 
 
@@ -63,6 +69,8 @@ def main():
         cmd += ["--collect-data", pkg]
     for mod in HIDDEN:
         cmd += ["--hidden-import", mod]
+    for mod in EXCLUDE:
+        cmd += ["--exclude-module", mod]
     cmd.append(ENTRY)
 
     print("打包命令：\n  " + " ".join(cmd) + "\n")
@@ -85,7 +93,7 @@ def main():
     if args.skip_selftest:
         return 0
 
-    print("跑冒烟测试 (--selftest, 真的做一次等值面提取+ASTRA重建)...")
+    print("跑冒烟测试 (--selftest, 真的做一次等值面提取+ASTRA重建+SSIM对比)...")
     env = dict(os.environ)
     env["QT_QPA_PLATFORM"] = "offscreen"
     r = subprocess.run([exe, "--selftest"], capture_output=True, timeout=180, env=env)

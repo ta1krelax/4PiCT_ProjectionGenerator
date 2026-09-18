@@ -36,10 +36,13 @@ class SliceViewer(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.fig = Figure(figsize=(6, 2.4))
+        # Stacked vertically (3 rows x 1 col), not side-by-side: this widget lives in a
+        # narrower-but-taller right-hand column, so each slice gets the full column
+        # width instead of being squeezed into a third of it.
+        self.fig = Figure(figsize=(4.5, 10))
         self.canvas = FigureCanvas(self.fig)
-        self.axes = self.fig.subplots(1, 3)
-        layout.addWidget(self.canvas)
+        self.axes = self.fig.subplots(3, 1)
+        layout.addWidget(self.canvas, 1)
 
         self.sliders: dict[str, QtWidgets.QSlider] = {}
         self.slider_labels: dict[str, QtWidgets.QLabel] = {}
