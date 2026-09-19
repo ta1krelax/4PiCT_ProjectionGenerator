@@ -12,7 +12,14 @@ SSIM功能(只是导入/重建/看等值面), Warp的JIT编译器不会被触发
 带着它。
 
 打完之后自己跑一遍 `exe --selftest`（真的做一次等值面提取+一次ASTRA重建+一次
-跟合成参考网格的SSIM对比, 不是只看窗口能不能开）。
+跟合成参考网格的SSIM对比, 不是只看窗口能不能开）, 而且是从一个跟项目源码无关
+的临时目录里调用exe的。
+
+**重要**: SSIM功能会懒加载 raytrace_gpu (-> warp), 而 warp 的 @wp.kernel 装饰器
+在导入时要用 inspect/linecache 读被装饰函数的*真实源码文本*, PyInstaller打包后
+的模块只是字节码, 没有可读的.py文件——装饰器只记得一个裸文件名, 运行时靠当前
+工作目录去找。所以跟 build_exe.py 一样, 这里也要把 raytrace_gpu.py 真实源码
+复制到exe旁边, 并且 recon_viewer_gui.py 启动时会强制chdir到exe所在目录。
 """
 
 import argparse
@@ -20,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 NAME = "CT4PiReconViewer"
 ENTRY = "recon_viewer_gui.py"
@@ -33,6 +41,7 @@ EXCLUDE = [
     "warp.tests", "warp.examples", "warp.jax_experimental", "warp.render",
     "warp.fem", "warp.sim",
 ]
+RUNTIME_SOURCE_FILES = ["raytrace_gpu.py"]
 
 
 def main():
@@ -71,6 +80,8 @@ def main():
         cmd += ["--hidden-import", mod]
     for mod in EXCLUDE:
         cmd += ["--exclude-module", mod]
+    for src in RUNTIME_SOURCE_FILES:
+        cmd += ["--add-data", f"{src};."]
     cmd.append(ENTRY)
 
     print("打包命令：\n  " + " ".join(cmd) + "\n")
@@ -87,16 +98,25 @@ def main():
     if not os.path.exists(exe):
         print(f"没找到产物 {exe}")
         return 1
+
+    if not args.onefile:
+        exe_dir = os.path.dirname(exe)
+        for src in RUNTIME_SOURCE_FILES:
+            shutil.copy2(src, os.path.join(exe_dir, src))
+
     size = os.path.getsize(exe) / 1e6
     print(f"\n产物：{exe}  ({size:.1f} MB)")
 
     if args.skip_selftest:
         return 0
 
-    print("跑冒烟测试 (--selftest, 真的做一次等值面提取+ASTRA重建+SSIM对比)...")
+    print("跑冒烟测试 (--selftest, 真的做一次等值面提取+ASTRA重建+SSIM对比, 从跟源码无关的目录里调用)...")
     env = dict(os.environ)
     env["QT_QPA_PLATFORM"] = "offscreen"
-    r = subprocess.run([exe, "--selftest"], capture_output=True, timeout=180, env=env)
+    r = subprocess.run(
+        [os.path.abspath(exe), "--selftest"],
+        capture_output=True, timeout=180, env=env, cwd=tempfile.gettempdir(),
+    )
     ok = r.returncode == 0
     print(
         ("  通过：" if ok else "  失败：")

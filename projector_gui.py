@@ -19,6 +19,23 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+# Warp's @wp.kernel decorator needs the DECORATED FUNCTION'S REAL SOURCE TEXT at import
+# time (inspect.getsourcelines / linecache), to transpile it to C++/CUDA. PyInstaller's
+# frozen bytecode has no such text -- compiled functions only remember a bare filename
+# (e.g. "raytrace_gpu.py", no directory), which linecache resolves relative to the
+# process's *current working directory*. build_exe.py ships a real copy of
+# raytrace_gpu.py next to the exe for exactly this reason; forcing cwd to the exe's own
+# directory here makes that resolve correctly no matter how the exe was launched
+# (double-click, a shortcut with a different "Start in", a launcher script, etc.) --
+# without this, it only "worked" by accident whenever cwd happened to already be the
+# source checkout (e.g. our own build-script self-test, which chdir's there first).
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", None)
+    if _meipass and os.path.isfile(os.path.join(_meipass, "raytrace_gpu.py")):
+        os.chdir(_meipass)  # --onefile: build_exe.py bundles it there via --add-data
+    else:
+        os.chdir(os.path.dirname(sys.executable))  # --onedir: shipped next to the exe
+
 import glob
 import json
 import time

@@ -25,6 +25,18 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+# See projector_gui.py for why: warp's @wp.kernel needs the decorated function's real
+# source text (inspect/linecache) at import time, which PyInstaller's frozen bytecode
+# doesn't have -- only a bare filename resolved relative to cwd. This matters here too,
+# since loading a reference STL for SSIM lazily imports raytrace_gpu -> warp.
+# build_recon_viewer_exe.py ships raytrace_gpu.py next to the exe for this to find.
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", None)
+    if _meipass and os.path.isfile(os.path.join(_meipass, "raytrace_gpu.py")):
+        os.chdir(_meipass)  # --onefile: build_recon_viewer_exe.py bundles it via --add-data
+    else:
+        os.chdir(os.path.dirname(sys.executable))  # --onedir: shipped next to the exe
+
 import json
 import time
 import traceback

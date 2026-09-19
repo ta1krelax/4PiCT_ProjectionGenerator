@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('raytrace_gpu.py', '.')]
 binaries = []
 hiddenimports = ['scipy.spatial.transform._rotation_groups']
 datas += collect_data_files('matplotlib')
